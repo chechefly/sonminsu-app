@@ -28,54 +28,141 @@ async function searchNaver(keyword) {
   } catch { return []; }
 }
 
-async function analyzeWithClaude(input) {
-  const isImage = input.startsWith("data:");
-  const isUrl = input.startsWith("http");
+// 블로그 URL → HTML fetch → Claude 파싱
+async function analyzeUrl(url) {
+  // 1. HTML 가져오기
+  const fetchRes = await fetch(`${PROXY}/fetch?url=${encodeURIComponent(url)}`);
+  const fetchData = await fetchRes.json();
+  if (!fetchData.html) throw new Error("HTML fetch 실패");
 
-  const prompt = `K콘텐츠 착장/뷰티 정보를 분석해줘. JSON만 반환, 다른 텍스트 없이.
-형식:
-{
-  "celebrity": {"name": "이름또는null", "group": "그룹또는null", "content": "예능드라마또는null"},
-  "originalImage": "인물사진URL또는null",
-  "items": [{"category": "카테고리", "brand": "브랜드", "product": "상품명", "searchKeyword": "네이버쇼핑검색어"}]
-}`;
-
-  let messages;
-  if (isImage) {
-    messages = [{
-      role: "user",
-      content: [
-        { type: "image", source: { type: "base64", media_type: input.split(";")[0].split(":")[1], data: input.split(",")[1] } },
-        { type: "text", text: "이 사진의 인물 착장과 뷰티 아이템을 분석해줘. " + prompt }
-      ]
-    }];
-  } else if (isUrl) {
-    messages = [{ role: "user", content: `이 URL 페이지의 착장 정보를 분석해줘: ${input}\n${prompt}` }];
-  } else {
-    messages = [{ role: "user", content: `"${input}" 관련 최근 착장 정보를 알려줘. ${prompt}` }];
+  // 2. HTML에서 이미지 URL 추출
+  const imgRegex = /src="(https?:\/\/[^"]+(?:jpg|jpeg|png|webp)[^"]*)"/gi;
+  const images = [];
+  let match;
+  while ((match = imgRegex.exec(fetchData.html)) !== null) {
+    const src = match[1];
+    if (!src.includes('icon') && !src.includes('logo') && !src.includes('btn')) {
+      images.push(src);
+    }
   }
 
-  const res = await fetch(`${PROXY}/claude`, {
+  // 3. HTML에서 텍스트 추출
+  const text = fetchData.html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 8000);
+
+  // 4. Claude로 파싱
+  const claudeRes = await fetch(`${PROXY}/claude`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2000,
-      messages,
-    }),
+      messages: [{
+        role: "user",
+        content: `아래는 K콘텐츠 패션 블로그 텍스트야. 인물 정보와 착장 아이템을 추출해줘.
+이미지 목록: ${JSON.stringify(images.slice(0, 20))}
+
+텍스트:
+${text}
+
+JSON만 반환, 다른 텍스트 없이:
+{
+  "celebrity": {"name": "인물이름또는null", "group": "그룹또는null", "content": "예능드라마또는null"},
+  "originalImage": "인물이 잘나온 대표사진URL (이미지목록에서 선택)",
+  "items": [
+    {
+      "category": "카테고리",
+      "brand": "브랜드명",
+      "product": "상품명",
+      "price": 가격숫자또는null,
+      "searchKeyword": "네이버쇼핑검색어",
+      "itemImage": "해당아이템착용사진URL또는null (이미지목록에서 선택)"
+    }
+  ]
+}`
+      }]
+    })
   });
 
-  const data = await res.json();
-  const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+  const claudeData = await claudeRes.json();
+  const claudeText = (claudeData.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+  try {
+    return JSON.parse(claudeText.replace(/```json|```/g, "").trim());
+  } catch { return null; }
+}
+
+// 사진 업로드 → Claude Vision 파싱
+async function analyzeImage(base64) {
+  const claudeRes = await fetch(`${PROXY}/claude`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 2000,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: base64.split(";")[0].split(":")[1], data: base64.split(",")[1] } },
+          { type: "text", text: `이 사진의 착장과 뷰티 아이템을 분석해줘. JSON만 반환:
+{
+  "celebrity": {"name": "이름또는null", "group": "그룹또는null", "content": "예능드라마또는null"},
+  "originalImage": null,
+  "items": [{"category": "카테고리", "brand": "브랜드또는추정브랜드", "product": "상품명또는설명", "price": null, "searchKeyword": "네이버쇼핑검색어", "itemImage": null}]
+}` }
+        ]
+      }]
+    })
+  });
+  const claudeData = await claudeRes.json();
+  const text = (claudeData.content || []).filter(b => b.type === "text").map(b => b.text).join("");
   try {
     return JSON.parse(text.replace(/```json|```/g, "").trim());
   } catch { return null; }
 }
 
+async function buildPost(analysis, type, input) {
+  const itemsWithLinks = await Promise.all(
+    (analysis.items || []).map(async (item, i) => {
+      await new Promise(r => setTimeout(r, i * 300));
+      const shopItems = await searchNaver(item.searchKeyword || `${item.brand} ${item.product}`);
+      return {
+        id: `item_${Date.now()}_${i}`,
+        category: item.category,
+        brand: item.brand,
+        product: item.product,
+        price: item.price,
+        itemImage: item.itemImage || null,
+        shopItems,
+        selectedShop: shopItems[0] || null,
+        platform: CATEGORY_PLATFORMS[item.category] || "naver",
+        affiliateLink: null,
+      };
+    })
+  );
+
+  return {
+    id: `post_${Date.now()}`,
+    createdAt: new Date().toISOString(),
+    source: {
+      type,
+      platform: type === "url" ? "blog" : "upload",
+      url: type === "url" ? input : null,
+      originalImage: analysis.originalImage || (type === "image" ? input : null),
+    },
+    celebrity: analysis.celebrity || { name: null, group: null, content: null },
+    items: itemsWithLinks,
+    content: { status: "saved", cardNews: null, publishedAt: null, platform: null },
+  };
+}
+
 export default function App() {
   const [tab, setTab] = useState("sourcing");
   const [urlInput, setUrlInput] = useState("");
-  const [searchInput, setSearchInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadingStep, setLoadingStep] = useState("");
   const [result, setResult] = useState(null);
@@ -84,47 +171,17 @@ export default function App() {
   const [newChannel, setNewChannel] = useState("");
   const fileRef = useRef();
 
-  const runProcess = async (input, type) => {
+  const runUrl = async () => {
+    if (!urlInput) return;
     setLoading(true);
     setResult(null);
     try {
-      setLoadingStep("AI 분석 중...");
-      const analysis = await analyzeWithClaude(input);
-      if (!analysis) throw new Error("분석 실패");
-
+      setLoadingStep("블로그 읽는 중...");
+      const analysis = await analyzeUrl(urlInput);
+      if (!analysis) throw new Error("파싱 실패");
       setLoadingStep("쇼핑 링크 검색 중...");
-      const itemsWithLinks = await Promise.all(
-        (analysis.items || []).map(async (item, i) => {
-          await new Promise(r => setTimeout(r, i * 300));
-          const shopItems = await searchNaver(item.searchKeyword || `${item.brand} ${item.product}`);
-          return {
-            id: `item_${Date.now()}_${i}`,
-            category: item.category,
-            brand: item.brand,
-            product: item.product,
-            shopItems,
-            selectedShop: shopItems[0] || null,
-            platform: CATEGORY_PLATFORMS[item.category] || "naver",
-            affiliateLink: null,
-          };
-        })
-      );
-
-      setResult({
-        id: `post_${Date.now()}`,
-        createdAt: new Date().toISOString(),
-        source: {
-          type,
-          platform: type === "url" ? "url" : type === "image" ? "upload" : "search",
-          url: type === "url" ? input : null,
-          originalImage: analysis.originalImage || (type === "image" ? input : null),
-        },
-        celebrity: analysis.celebrity || { name: null, group: null, content: null },
-        items: itemsWithLinks,
-        content: { status: "saved", cardNews: null, publishedAt: null, platform: null },
-      });
+      setResult(await buildPost(analysis, "url", urlInput));
     } catch (err) {
-      console.error("에러:", err);
       alert("오류: " + err.message);
     }
     setLoading(false);
@@ -134,7 +191,20 @@ export default function App() {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => runProcess(ev.target.result, "image");
+    reader.onload = async (ev) => {
+      setLoading(true);
+      setResult(null);
+      try {
+        setLoadingStep("사진 분석 중...");
+        const analysis = await analyzeImage(ev.target.result);
+        if (!analysis) throw new Error("분석 실패");
+        setLoadingStep("쇼핑 링크 검색 중...");
+        setResult(await buildPost(analysis, "image", ev.target.result));
+      } catch (err) {
+        alert("오류: " + err.message);
+      }
+      setLoading(false);
+    };
     reader.readAsDataURL(file);
   };
 
@@ -184,23 +254,31 @@ export default function App() {
       <main style={{ maxWidth: 820, margin: "0 auto", padding: "28px 20px" }}>
         {tab === "sourcing" && (
           <div className="fu">
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 1, marginBottom: 28, border: "1px solid #1A1A1A" }}>
+            {/* 입력 2가지 */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, marginBottom: 28, border: "1px solid #1A1A1A" }}>
+              {/* URL */}
               <div style={{ padding: "20px 18px", background: "#0F0F0F", borderRight: "1px solid #1A1A1A" }}>
-                <div style={{ fontFamily: "'DM Mono'", fontSize: 9, color: "#444", letterSpacing: ".12em", marginBottom: 10, textTransform: "uppercase" }}>URL 입력</div>
-                <input value={urlInput} onChange={e => setUrlInput(e.target.value)} onKeyDown={e => e.key === "Enter" && urlInput && !loading && runProcess(urlInput, "url")} placeholder="블로그, 트위터, 인스타 URL" style={{ width: "100%", background: "#161616", border: "1px solid #1A1A1A", color: "#F0EBE3", padding: "8px 10px", fontFamily: "'DM Mono'", fontSize: 10, marginBottom: 8 }} />
-                <button onClick={() => runProcess(urlInput, "url")} disabled={!urlInput || loading} style={{ width: "100%", background: urlInput && !loading ? "#F0EBE3" : "#1A1A1A", color: urlInput && !loading ? "#0C0C0C" : "#333", border: "none", padding: "8px", fontFamily: "'DM Mono'", fontSize: 9 }}>분석하기</button>
+                <div style={{ fontFamily: "'DM Mono'", fontSize: 9, color: "#444", letterSpacing: ".12em", marginBottom: 10, textTransform: "uppercase" }}>블로그 URL</div>
+                <input value={urlInput} onChange={e => setUrlInput(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && !loading && runUrl()}
+                  placeholder="네이버 블로그 URL 붙여넣기"
+                  style={{ width: "100%", background: "#161616", border: "1px solid #1A1A1A", color: "#F0EBE3", padding: "8px 10px", fontFamily: "'DM Mono'", fontSize: 10, marginBottom: 8 }}
+                />
+                <button onClick={runUrl} disabled={!urlInput || loading}
+                  style={{ width: "100%", background: urlInput && !loading ? "#F0EBE3" : "#1A1A1A", color: urlInput && !loading ? "#0C0C0C" : "#333", border: "none", padding: "8px", fontFamily: "'DM Mono'", fontSize: 9, letterSpacing: ".1em" }}>
+                  분석하기
+                </button>
               </div>
-              <div style={{ padding: "20px 18px", background: "#0F0F0F", borderRight: "1px solid #1A1A1A" }}>
+
+              {/* 사진 */}
+              <div style={{ padding: "20px 18px", background: "#0F0F0F" }}>
                 <div style={{ fontFamily: "'DM Mono'", fontSize: 9, color: "#444", letterSpacing: ".12em", marginBottom: 10, textTransform: "uppercase" }}>사진 업로드</div>
                 <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleFile} />
-                <div onClick={() => !loading && fileRef.current.click()} style={{ border: "1px dashed #1A1A1A", padding: "24px 10px", textAlign: "center", cursor: "pointer", fontFamily: "'DM Mono'", fontSize: 10, color: "#333" }}>
-                  클릭해서 업로드<br /><span style={{ fontSize: 8, color: "#2A2A2A" }}>JPG · PNG · WEBP</span>
+                <div onClick={() => !loading && fileRef.current.click()}
+                  style={{ border: "1px dashed #1A1A1A", padding: "24px 10px", textAlign: "center", cursor: "pointer", fontFamily: "'DM Mono'", fontSize: 10, color: "#333" }}>
+                  클릭해서 업로드<br />
+                  <span style={{ fontSize: 8, color: "#2A2A2A" }}>JPG · PNG · WEBP</span>
                 </div>
-              </div>
-              <div style={{ padding: "20px 18px", background: "#0F0F0F" }}>
-                <div style={{ fontFamily: "'DM Mono'", fontSize: 9, color: "#444", letterSpacing: ".12em", marginBottom: 10, textTransform: "uppercase" }}>검색어</div>
-                <input value={searchInput} onChange={e => setSearchInput(e.target.value)} onKeyDown={e => e.key === "Enter" && searchInput && !loading && runProcess(searchInput, "search")} placeholder="슬기, 솔로지옥, 카리나..." style={{ width: "100%", background: "#161616", border: "1px solid #1A1A1A", color: "#F0EBE3", padding: "8px 10px", fontFamily: "'DM Mono'", fontSize: 10, marginBottom: 8 }} />
-                <button onClick={() => runProcess(searchInput, "search")} disabled={!searchInput || loading} style={{ width: "100%", background: searchInput && !loading ? "#F0EBE3" : "#1A1A1A", color: searchInput && !loading ? "#0C0C0C" : "#333", border: "none", padding: "8px", fontFamily: "'DM Mono'", fontSize: 9 }}>검색하기</button>
               </div>
             </div>
 
@@ -213,8 +291,11 @@ export default function App() {
 
             {!loading && result && (
               <div className="fu">
+                {/* 인물 + 대표 사진 */}
                 <div style={{ display: "grid", gridTemplateColumns: result.source.originalImage ? "160px 1fr" : "1fr", gap: 20, marginBottom: 20, background: "#0F0F0F", border: "1px solid #1A1A1A", padding: 20 }}>
-                  {result.source.originalImage && <img src={result.source.originalImage} alt="원본" style={{ width: "100%", aspectRatio: "3/4", objectFit: "cover" }} onError={e => e.target.style.display = "none"} />}
+                  {result.source.originalImage && (
+                    <img src={result.source.originalImage} alt="원본" style={{ width: "100%", aspectRatio: "3/4", objectFit: "cover" }} onError={e => e.target.style.display = "none"} />
+                  )}
                   <div>
                     <div style={{ fontFamily: "'DM Mono'", fontSize: 8, color: "#333", letterSpacing: ".15em", marginBottom: 8 }}>RESULT</div>
                     <h2 style={{ fontFamily: "'Noto Serif KR'", fontSize: 20, fontWeight: 400, marginBottom: 4 }}>{result.celebrity.name || "알 수 없음"}</h2>
@@ -227,13 +308,21 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* 아이템 */}
                 <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
                   {result.items.map(item => (
                     <div key={item.id} style={{ background: "#0F0F0F", border: "1px solid #1A1A1A", padding: "16px 18px" }}>
-                      <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 10 }}>
-                        <span style={{ fontFamily: "'DM Mono'", fontSize: 8, color: "#888", border: "1px solid #2A2A2A", padding: "1px 7px" }}>{item.category}</span>
-                        <span style={{ fontFamily: "'Noto Serif KR'", fontSize: 13, color: "#F0EBE3" }}>{item.brand} {item.product}</span>
+                      <div style={{ display: "flex", gap: 12, marginBottom: 10 }}>
+                        {item.itemImage && (
+                          <img src={item.itemImage} alt="" style={{ width: 60, height: 60, objectFit: "cover", flexShrink: 0 }} onError={e => e.target.style.display = "none"} />
+                        )}
+                        <div>
+                          <span style={{ fontFamily: "'DM Mono'", fontSize: 8, color: "#888", border: "1px solid #2A2A2A", padding: "1px 7px", marginRight: 6 }}>{item.category}</span>
+                          <span style={{ fontFamily: "'Noto Serif KR'", fontSize: 13, color: "#F0EBE3" }}>{item.brand} {item.product}</span>
+                          {item.price && <div style={{ fontFamily: "'DM Mono'", fontSize: 11, color: "#888", marginTop: 4 }}>블로그 가격 ₩{item.price.toLocaleString()}</div>}
+                        </div>
                       </div>
+
                       {item.shopItems.length > 0 ? (
                         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                           {item.shopItems.map((shop, si) => (
@@ -241,7 +330,7 @@ export default function App() {
                               {shop.image && <img src={shop.image} alt="" style={{ width: 44, height: 44, objectFit: "cover", flexShrink: 0 }} onError={e => e.target.style.display = "none"} />}
                               <div style={{ flex: 1, minWidth: 0 }}>
                                 <div style={{ fontFamily: "'Noto Serif KR'", fontSize: 11, color: "#CCC", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 3 }}>{shop.title}</div>
-                                <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                                <div style={{ display: "flex", gap: 8 }}>
                                   {shop.price && <span style={{ fontFamily: "'DM Mono'", fontSize: 12, color: "#F0EBE3" }}>₩{shop.price.toLocaleString()}</span>}
                                   <span style={{ fontFamily: "'DM Mono'", fontSize: 9, color: "#444" }}>{shop.mall}</span>
                                 </div>
@@ -266,8 +355,10 @@ export default function App() {
           <div className="fu">
             <div style={{ fontFamily: "'DM Mono'", fontSize: 9, color: "#333", letterSpacing: ".15em", marginBottom: 20, textTransform: "uppercase" }}>X 채널 관리</div>
             <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
-              <input value={newChannel} onChange={e => setNewChannel(e.target.value)} placeholder="@채널명 입력" style={{ flex: 1, background: "#0F0F0F", border: "1px solid #1A1A1A", color: "#F0EBE3", padding: "10px 14px", fontFamily: "'DM Mono'", fontSize: 11 }} />
-              <button onClick={() => { if (!newChannel) return; setChannels(prev => [...prev, { handle: newChannel.replace("@", ""), label: newChannel.replace("@", ""), category: "패션" }]); setNewChannel(""); }} style={{ background: "#F0EBE3", color: "#0C0C0C", border: "none", padding: "10px 20px", fontFamily: "'DM Mono'", fontSize: 10 }}>+ 추가</button>
+              <input value={newChannel} onChange={e => setNewChannel(e.target.value)} placeholder="@채널명 입력"
+                style={{ flex: 1, background: "#0F0F0F", border: "1px solid #1A1A1A", color: "#F0EBE3", padding: "10px 14px", fontFamily: "'DM Mono'", fontSize: 11 }} />
+              <button onClick={() => { if (!newChannel) return; setChannels(prev => [...prev, { handle: newChannel.replace("@", ""), label: newChannel.replace("@", ""), category: "패션" }]); setNewChannel(""); }}
+                style={{ background: "#F0EBE3", color: "#0C0C0C", border: "none", padding: "10px 20px", fontFamily: "'DM Mono'", fontSize: 10 }}>+ 추가</button>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {channels.map((ch, i) => (
@@ -303,6 +394,7 @@ export default function App() {
                       <div style={{ fontFamily: "'Noto Serif KR'", fontSize: 15, fontWeight: 400, marginBottom: 6 }}>
                         {post.celebrity.name || "알 수 없음"}
                         {post.celebrity.group && <span style={{ fontFamily: "'DM Mono'", fontSize: 10, color: "#555", marginLeft: 8 }}>{post.celebrity.group}</span>}
+                        {post.celebrity.content && <span style={{ fontFamily: "'DM Mono'", fontSize: 10, color: "#555", marginLeft: 8 }}>{post.celebrity.content}</span>}
                       </div>
                       <div style={{ fontFamily: "'DM Mono'", fontSize: 9, color: "#444", marginBottom: 10 }}>{new Date(post.createdAt).toLocaleDateString("ko-KR")} · 아이템 {post.items.length}개</div>
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
