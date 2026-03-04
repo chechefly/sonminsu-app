@@ -69,12 +69,12 @@ const response = await fetch("https://naver-proxy-lac.vercel.app/api/claude", {
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2000,
-      tools: isUrl ? [{ type: "web_search_20250305", name: "web_search" }] : undefined,
+      tools: undefined,
       messages: [{ role: "user", content }],
     }),
   });
 
-  const data = await res.json();
+  const data = await response.json();
   const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
   try {
     return JSON.parse(text.replace(/```json|```/g, "").trim());
