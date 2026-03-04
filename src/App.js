@@ -61,9 +61,11 @@ JSON만 반환.
   "items": [{"category": "카테고리", "brand": "브랜드", "product": "상품명", "searchKeyword": "네이버쇼핑검색어"}]
 }`;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+const response = await fetch("https://naver-proxy-lac.vercel.app/api/claude", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+  },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2000,
